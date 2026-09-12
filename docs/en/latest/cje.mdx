@@ -1,0 +1,148 @@
+---
+title: "Calibrating judge scores with CJE"
+description: "Export EDSL judge results for calibrated policy comparisons with CJE."
+---
+
+[CJE](https://github.com/cimo-labs/cje) calibrates judge scores against sampled
+oracle labels and estimates policy means with uncertainty. EDSL can collect the
+judge scores; the standalone
+[export recipe](https://github.com/expectedparrot/edsl/blob/main/docs/examples/cje_export.py)
+converts existing `Results` into CJE's input format. The recipe lives outside
+EDSL's core API and imports CJE only when running its analysis example.
+
+Use this workflow when each candidate policy has generated responses to a shared
+evaluation prompt set. An oracle label is the outcome you intend to measure,
+such as a human rating or verified answer score. Using another model as the
+reference measures agreement with that model's labels.
+
+## Run the offline example
+
+Use Python 3.10–3.13. From an EDSL source checkout, install EDSL and the CJE version
+used by this example:
+
+```bash
+python -m pip install -e . "cje-eval==0.7.1"
+```
+
+The example constructs native EDSL `Results` with synthetic scores and labels.
+It makes no model calls and requires no API keys. From the repository root:
+
+```bash
+PYTHONPATH=docs/examples python - <<'PY'
+from cje import analyze_dataset
+from cje_export import synthetic_example, to_cje_draws
+
+results, oracle_labels = synthetic_example()
+draws = to_cje_draws(
+    results,
+    judge_question="judge_score",
+    oracle_labels=oracle_labels,
+)
+analysis = analyze_dataset(
+    fresh_draws_data=draws,
+    fresh_judge_scale=(0, 100),
+    fresh_oracle_scale=(1, 5),
+    label_design="representative",
+)
+print(analysis.summary())
+print(analysis.metadata["claim_tier_by_policy"])
+print(analysis.metadata["transport_audits"])
+PY
+```
+
+The synthetic example supplies labels for a representative prompt sample. Its
+output demonstrates the interface; it is not evidence about any real model.
+Declare the actual judge and oracle scale bounds when adapting it to your data.
+
+In this fixture, `candidate` receives `REFUSE-LEVEL`: 7.5% of its judge scores
+fall outside the labeled calibration range. Both policies have transport state
+`NOT_CHECKED`. Read the displayed best reliable policy as the best unflagged
+estimate; residual transport remains untested.
+
+## Preserve the evaluation identities
+
+Each result's `scenario` must contain these fields before judging:
+
+| Field | Meaning |
+| --- | --- |
+| `policy_id` | Stable identity of the policy that generated the response, including relevant model, prompt, and generation settings. |
+| `prompt_id` | Identity of the evaluation item, shared across candidate policies and repeated draws. |
+| `prompt` | Original evaluation prompt text. |
+| `draw_idx` | Nonnegative integer identifying a particular response draw within a policy and prompt. |
+| `response` | The exact generated response being judged and labeled. |
+| `rubric_id` | Versioned identity of the full judging protocol, including the rubric, instructions, presentation, and score scale. |
+
+Pass the exact numerical answer field as `judge_question`, such as `"judge_score"`.
+The result's `model` describes the **judge**; the exporting function groups by
+`scenario.policy_id` to retain the response-generating policy. It requires a
+consistent judge model, agent, retained question metadata, and `rubric_id` within
+one export. Saved question metadata does not capture every question or survey
+setting. Change `rubric_id` whenever the rubric, answer instructions, score scale,
+presentation, or survey instructions change. The exporter cannot certify that
+this declaration describes the full protocol. Analyze distinct judging protocols
+separately.
+
+Repeated draws retain the same `prompt_id` and have different `draw_idx` values,
+even when their response text is identical. Do not derive either identity from
+the current row order. Use the same evaluation items across policies to support
+paired comparisons; changing the policy's instructions belongs in `policy_id`.
+
+## Attach oracle labels to exact responses
+
+First call `to_cje_draws(results, judge_question="judge_score")` without labels to
+obtain the response records. Each exported `observation_id` binds the complete
+serialized scenario, including the required identity fields and any additional
+context fields, together with the retained question metadata. Freeze the entire
+scenario before preparing a label sheet and collecting labels. Keep externally
+collected oracle labels in the separate `oracle_labels` mapping; adding them to
+the frozen scenario would change its identity.
+
+Select a probability sample of the frozen responses or prompt clusters, then
+collect labels for those exact responses. Build `oracle_labels` as a mapping
+from each selected `observation_id` to its numeric label and pass it back to
+`to_cje_draws`. Omit unselected IDs; numeric zero remains a label. The export
+rejects unknown label IDs, duplicate response identities, and invalid scores.
+Reordering results preserves label matches. Editing a response or rubric creates
+a different identity, so an old label must not be copied onto the changed item.
+
+`label_design="representative"` declares the sampling assumption; conversion
+does not establish it. For unequal known label inclusion probabilities, CJE
+supports `label_design="known_propensity"` with aligned per-policy propensity
+vectors. Targeted labels with unknown inclusion probabilities require
+`label_design="targeted_unknown"`, which disables residual augmentation and
+records that limitation. There is no fixed labeling percentage that guarantees
+accurate estimates or valid intervals.
+
+## Interpret the native CJE result
+
+CJE returns an `EstimationResult`; retain its diagnostics and claim tiers when
+reporting estimates. A returned result is not itself a calibration certificate:
+
+- `CALIBRATED_ORACLE_MEAN` uses the fitted judge-to-oracle mapping.
+- `DIRECT_ORACLE_MEAN` uses complete oracle coverage for that policy.
+- `RAW_JUDGE_MEAN` is an uncalibrated judge-scale quantity, with limitations.
+
+Fitting calibration needs at least four independent labeled prompt clusters;
+ten or more are recommended. With too few labels, a partially labeled policy
+can return a flagged raw estimate. Many repeated draws from one prompt do not
+create independent prompt clusters.
+
+Use `analysis.ci()` for the intervals actually computed by CJE. Version 0.7.1
+defaults to prompt-cluster robust inference with calibration uncertainty and
+t intervals on supported calibrated routes. For comparisons, use
+`analysis.compare_policies(i, j)` and inspect its method and `gate_flagged`
+fields. Multiple comparisons need a declared adjustment; CJE offers
+`analysis.compare_all_policies(adjust="bh")` for Benjamini–Hochberg FDR control.
+
+Read the reliability gates and transport states alongside the numbers. Scalar
+score support does not prove that calibration transfers across policies or that
+a ranking is valid. Policies without held-out transport probes are
+`NOT_CHECKED`. CJE's optional `TransportAuditConfig` grades independent probes
+against predeclared practical bias margins in **result output units**; probes
+must not have been used to fit calibration. Missing margins yield `NOT_GRADED`,
+and a graded audit can be `PASS`, `FAIL`, or `INCONCLUSIVE`.
+
+See CJE's [API guide](https://github.com/cimo-labs/cje/blob/v0.7.1/cje/interface/README.md)
+and [transport contract](https://github.com/cimo-labs/cje/blob/v0.7.1/cje/diagnostics/transport.py)
+for inference options and audit details. These estimates describe the supplied
+evaluation prompts under the declared sampling and calibration assumptions.

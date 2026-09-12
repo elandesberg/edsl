@@ -61,6 +61,7 @@
         "group": "Working with Results",
         "pages": [
           "en/latest/results",
+          "en/latest/cje",
           "en/latest/dataset",
           "en/latest/data",
           "en/latest/exceptions",
